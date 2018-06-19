@@ -342,7 +342,7 @@ def check_update():
             update_busy = False
         else:
             print("Debug to check this stuff is getting updated correctly:")
-            print("now: " + str(now) + "time.time(): " + str(time.time()) + "next_check: " + str(now + config['check_update_every_x_sec']))
+            print("now: " + str(now) + "time.time(): " + str(time.time()) + "next_check: " + str(now + config['check_delay_in_sec']))
             print("No update, checking again in "+ next_check + ".")
             while time.time() < now + config['check_delay_in_sec']:
                 if not go:
