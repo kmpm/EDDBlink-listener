@@ -16,6 +16,7 @@ import sqlite3
 import csv
 import codecs
 import plugins.eddblink_plug
+import sys
 
 from calendar import timegm
 from pathlib import Path
@@ -255,6 +256,23 @@ class Listener(object):
         
 # End of 'kfsone' code.
 
+def db_execute(db, sql_cmd, args = None):
+    cur = db.cursor()
+    success = False
+    result = None
+    while go and not success:
+        try:
+            if args:
+                result = cur.execute(sql_cmd, args)
+            else:
+                result = cur.execute(sql_cmd)
+            success = True
+        except sqlite3.OperationalError:
+            print("Database is locked, waiting for access.", end = "\r")
+            time.sleep(1)
+    return result
+    
+
 # We do this because the Listener object must be in the same thread that's running get_batch().
 def get_messages():
     listener = Listener()
@@ -263,9 +281,9 @@ def get_messages():
 def check_update():
     global update_busy
     
-    # Convert the number from the "check_delay_in_sec" setting, which is in seconds,
+    # Convert the number from the "check_update_every_x_sec" setting, which is in seconds,
     # into easily readable hours, minutes, seconds.
-    m, s = divmod(config['check_delay_in_sec'], 60)
+    m, s = divmod(config['check_update_every_x_sec'], 60)
     h, m = divmod(m, 60)
     next_check = ""
     if h > 0:
@@ -288,8 +306,8 @@ def check_update():
     # The following values only need to be assigned once, no need to be in the while loop.
     BASE_URL = plugins.eddblink_plug.BASE_URL
     FALLBACK_URL = plugins.eddblink_plug.FALLBACK_URL
-    COMMODITIES = "commodities.json"
-    commodities_path = Path(COMMODITIES)
+    LISTINGS = "listings.csv"
+    listings_path = Path(LISTINGS)
     Months = {'Jan':1, 'Feb':2, 'Mar':3, 'Apr':4, 'May':5, 'Jun':6, 'Jul':7, 'Aug':8, 'Sep':9, 'Oct':10, 'Nov':11, 'Dec':12}
        
     while go:
@@ -301,12 +319,12 @@ def check_update():
         # We want to get the files from Tromador's mirror, but if it's down we'll go to EDDB.io directly, instead.         
         if config['side'] == 'client':
             try:
-                urllib.request.urlopen(BASE_URL + COMMODITIES)
-                url = BASE_URL + COMMODITIES
+                urllib.request.urlopen(BASE_URL + LISTINGS)
+                url = BASE_URL + LISTINGS
             except:
-                url = FALLBACK_URL + COMMODITIES
+                url = FALLBACK_URL + LISTINGS
         else:
-            url = FALLBACK_URL + COMMODITIES
+            url = FALLBACK_URL + LISTINGS
 
         # Need to parse the "Last-Modified" header into a Unix-epoch, and Python's strptime()
         # won't work because it is locale-dependent, meaning it would only work in English-
@@ -320,8 +338,8 @@ def check_update():
         dumpModded = timegm(dumpDT.timetuple())
 
         # Now that we have the Unix epoch time of the dump file, get the same from the local file.
-        if Path.exists(eddbPath / commodities_path):
-            localModded = (eddbPath / commodities_path).stat().st_mtime
+        if Path.exists(eddbPath / listings_path):
+            localModded = (eddbPath / listings_path).stat().st_mtime
             
         # Trigger daily EDDB update if the dumps have updated since last run.
         # Otherwise, go to sleep for an hour before checking again.
@@ -344,7 +362,7 @@ def check_update():
             print("Debug to check this stuff is getting updated correctly:")
             print("now: " + str(now) + " time.time(): " + str(time.time()) + " next_check: " + str(now + config['check_delay_in_sec']))
             print("No update, checking again in "+ next_check + ".")
-            while time.time() < now + config['check_delay_in_sec']:
+            while time.time() < now + config['check_update_every_x_sec']:
                 if not go:
                     print("Shutting down update checker.")
                     break
@@ -365,8 +383,8 @@ def load_config():
     config = OrderedDict([\
                             ('side', 'client'),                                                      \
                             ('verbose', True),                                                       \
-                            ('plugin_options', "all,skipvend,force"),                                                       \
-                            ('check_delay_in_sec', 3600),                                            \
+                            ('plugin_options', "all,skipvend,force"),                                \
+                            ('check_update_every_x_sec', 3600),                                      \
                             ('export_every_x_sec', 300),                                             \
                             ('export_path', './data/eddb'),                                          \
                             ('whitelist',                                                            \
@@ -395,6 +413,9 @@ def load_config():
                     else:
                         # If any settings don't exist in the config_file, need to update the file.
                         write_config = True
+                if temp.get("check_delay_in_sec"):
+                    config["check_update_every_x_sec"] = temp["check_delay_in_sec"]
+                    write_config = True
             except:
                 # If, for some reason, there's an error trying to load
                 # the config_file, treat it as if it doesn't exist.
@@ -464,13 +485,13 @@ def validate_config():
         valid = False
         config_file = config_file.replace('"plugin_options"','"plugin_options_invalid"')
         
-    if isinstance(config['check_delay_in_sec'], int):
-        if config['check_delay_in_sec'] < 1:
+    if isinstance(config['check_update_every_x_sec'], int):
+        if config['check_update_every_x_sec'] < 1:
             valid = False
-            config_file = config_file.replace('"check_delay_in_sec"','"check_delay_in_sec_invalid"')
+            config_file = config_file.replace('"check_update_every_x_sec"','"check_update_every_x_sec_invalid"')
     else:
         valid = False
-        config_file = config_file.replace('"check_delay_in_sec"','"check_delay_in_sec_invalid"')
+        config_file = config_file.replace('"check_update_every_x_sec"','"check_update_every_x_sec_invalid"')
         
     if isinstance(config['export_every_x_sec'], int):
         if config['export_every_x_sec'] < 1:
@@ -494,10 +515,9 @@ def validate_config():
 def process_messages():
     global process_ack
     tdb = tradedb.TradeDB(load=False)
-    db = tdb.getDB()
-
+    
     while go:
-        # We don't want the threads intefering with each other,
+        # We don't want the threads interfering with each other,
         # so pause this one if either the update checker or
         # listings exporter report that they're active.
         if update_busy or export_busy:
@@ -532,7 +552,8 @@ def process_messages():
         
         modified = entry.timestamp.replace('T',' ').replace('Z','')
         commodities= entry.commodities
-
+        
+        db = tdb.getDB()
         start_update = datetime.datetime.now()
         for commodity in commodities:
             # Get item_id using commodity name from message.
@@ -558,44 +579,48 @@ def process_messages():
             supply_units = commodity['stock']
             supply_level = commodity['stockBracket'] if commodity['stockBracket'] != '' else -1
             try:
-                db.execute("""INSERT INTO StationItem
-                    (station_id, item_id, modified,
-                     demand_price, demand_units, demand_level,
-                     supply_price, supply_units, supply_level)
-                    VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ? )""",
-                    (station_id, item_id, modified,
-                    demand_price, demand_units, demand_level,
-                    supply_price, supply_units, supply_level))
+                db_execute(db, """INSERT INTO StationItem
+                            (station_id, item_id, modified,
+                             demand_price, demand_units, demand_level,
+                             supply_price, supply_units, supply_level, from_live)
+                            VALUES ( ?, ?, ?, ?, ?, ?, ?, ?, ?, 1 )""",
+                            (station_id, item_id, modified,
+                            demand_price, demand_units, demand_level,
+                            supply_price, supply_units, supply_level))
             except sqlite3.IntegrityError:
                 try:
-                    db.execute("""UPDATE StationItem
-                        SET modified = ?,
-                         demand_price = ?, demand_units = ?, demand_level = ?,
-                         supply_price = ?, supply_units = ?, supply_level = ?
-                        WHERE station_id = ? AND item_id = ?""",
-                        (modified, 
-                         demand_price, demand_units, demand_level, 
-                         supply_price, supply_units, supply_level,
-                        station_id, item_id))
+                    db_execute(db, """UPDATE StationItem
+                                SET modified = ?,
+                                 demand_price = ?, demand_units = ?, demand_level = ?,
+                                 supply_price = ?, supply_units = ?, supply_level = ?,
+                                 from_live = 1
+                                WHERE station_id = ? AND item_id = ?""",
+                                (modified, 
+                                 demand_price, demand_units, demand_level, 
+                                 supply_price, supply_units, supply_level,
+                                 station_id, item_id))
                 except sqlite3.IntegrityError:
-                    pass
+                    print("Unable to insert or update: " + commodity)
+                    success = True
+        
+        # Don't try to commit if there are still messages waiting.
+        if len(q) == 0:
+            success = False
+            while not success:
+                try:
+                    db.commit()
+                    success = True
+                except sqlite3.OperationalError:
+                    print("Database is locked, waiting for access.", end = "\r")
+                    time.sleep(1)
+                
+        db.close()
 
-        success = False
-        # Don't try to commit if there are still messages waiting,
-        # retry commit until it succeeds.
-        while not success and len(q) == 0:
-            try:
-                db.commit()
-            except sqlite3.DatabaseError:
-                time.sleep(1)
-                continue
-            success = True
-
-            if config['verbose']:
-                print("Market update for " + system + "/" + station\
-                  + " finished in " + str(datetime.datetime.now() - start_update) + " seconds.")
-            else:
-                print( "Updated " + system + "/" + station)
+        if config['verbose']:
+            print("Market update for " + system + "/" + station\
+                  + " finished in " + str(int((datetime.datetime.now() - start_update).total_seconds() * 1000) / 1000) + " seconds.")
+        else:
+            print( "Updated " + system + "/" + station)
 
     print("Shutting down message processor.")
 
@@ -613,7 +638,7 @@ def fetchIter(cursor, arraysize=1000):
             
 def export_listings():
     """
-    Creates a "listings.csv" file in "export_path" every X seconds,
+    Creates a "listings-live.csv" file in "export_path" every X seconds,
     as defined in the configuration file.
     Only runs when program configured as server.
     """
@@ -621,8 +646,8 @@ def export_listings():
 
     if config['side'] == 'server':
         tdb = tradedb.TradeDB(load=False)
-        cur = tdb.getDB().cursor()
-        listings_file = (Path(config['export_path']) / Path("listings.csv")).resolve()
+        db = tdb.getDB()
+        listings_file = (Path(config['export_path']).resolve() / Path("listings-live.csv"))
         listings_tmp = listings_file.with_suffix(".tmp")
         print("Listings will be exported to: \n\t" + str(listings_file))
 
@@ -659,15 +684,18 @@ def export_listings():
             # because it waits for one from this, and this won't acknowledge
             # until it's finished exporting.
             while not (process_ack):
-                pass
+                if not go:
+                    break
+            print("Busy signal acknowledged, getting listings for export.")
             try:
-                results = list(fetchIter(cur.execute("SELECT * FROM StationItem ORDER BY station_id, item_id")))
-            except sqlite3.DatabaseError:
+                results = list(fetchIter(db_execute(db, "SELECT * FROM StationItem WHERE from_live = 1 ORDER BY station_id, item_id")))
+            except sqlite3.DatabaseError as e:
+                print(e)
                 export_busy = False
                 continue
             export_busy = False
             
-            print("Exporting 'listings.csv'. (Got listings in " + str(datetime.datetime.now() - start) + ")")
+            print("Exporting 'listings-live.csv'. (Got listings in " + str(datetime.datetime.now() - start) + ")")
             with open(str(listings_tmp), "w") as f:
                 f.write("id,station_id,commodity_id,supply,supply_bracket,buy_price,sell_price,demand,demand_bracket,collected_at\n")
                 lineNo = 1
@@ -684,20 +712,24 @@ def export_listings():
                     supply = str(result[6])
                     supply_bracket = str(result[7])
                     collected_at = str(timegm(datetime.datetime.strptime(result[8],'%Y-%m-%d %H:%M:%S').timetuple()))
-                    f.write(str(lineNo) + "," + station_id + "," + commodity_id + ","\
+                    listing = station_id + "," + commodity_id + ","\
                              + supply + "," + supply_bracket + "," + buy_price + ","\
                              + sell_price + "," + demand + "," + demand_bracket + ","\
-                             + collected_at + "\n")
+                             + collected_at
+                    f.write(str(lineNo) + "," + listing + "\n")
                     lineNo += 1
-            
+            del results
             # If we aborted the export because we lost go, listings_tmp is broken and useless, so delete it. 
             if not go:
                 listings_tmp.unlink()
                 print("Export aborted, received shutdown signal.")
                 break
             
-            if listings_file.exists():
-                listings_file.unlink()
+            while listings_file.exists():
+                try:
+                    listings_file.unlink()
+                except:
+                    time.sleep(1)
             listings_tmp.rename(listings_file)
             print("Export completed in " + str(datetime.datetime.now() - start))
 
@@ -725,6 +757,15 @@ if firstRun:
     print("command: 'python trade.py import -P eddblink -O clean,skipvend'")
     trade.main(('trade.py','import','-P','eddblink','-O','clean,skipvend'))
     print("Finished running EDDBlink plugin, no need to run again.")
+
+if tmpFile.find("from_live INTEGER DEFAULT 0 NOT NULL,") == -1:
+    print("Database not updated by EDDBlink v0.26+, running now.")
+    trade.main(('trade.py','import','-P','eddblink'))
+    # Check to see if plugin updated database.
+    with tdb.sqlPath.open('r', encoding = "utf-8") as fh:
+        tmpFile = fh.read()
+    if tmpFile.find("from_live INTEGER DEFAULT 0 NOT NULL,") == -1:
+        sys.exit("EDDBlink plugin not at least v0.26, must update for listener to work correctly.")
 
 update_busy = False
 process_ack = False
