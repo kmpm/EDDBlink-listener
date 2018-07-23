@@ -373,8 +373,6 @@ def check_update():
             print("Update complete, turning off busy signal.")
             update_busy = False
         else:
-            print("Debug to check this stuff is getting updated correctly:")
-            print("now: " + str(now) + " time.time(): " + str(time.time()) + " next_check: " + str(now + config['check_update_every_x_sec']))
             print("No update, checking again in "+ next_check + ".")
             while time.time() < now + config['check_update_every_x_sec']:
                 if not go:
@@ -786,11 +784,10 @@ def export_listings():
             export_busy = False
             
             print("Exporting 'listings-live.csv'. (Got listings in " + str(datetime.datetime.now() - start) + ")")
-            #with open(str(listings_tmp), "w") as f:
-            #    f.write("id,station_id,commodity_id,supply,supply_bracket,buy_price,sell_price,demand,demand_bracket,collected_at\n")
-            listings_string = "id,station_id,commodity_id,supply,supply_bracket,buy_price,sell_price,demand,demand_bracket,collected_at\n"
-            lineNo = 1
-            for result in results:
+            with open(str(listings_tmp), "w") as f:
+                f.write("id,station_id,commodity_id,supply,supply_bracket,buy_price,sell_price,demand,demand_bracket,collected_at\n")
+                lineNo = 1
+                for result in results:
                     # If we lose go during export, we need to abort.
                     if not go:
                         break
@@ -807,15 +804,9 @@ def export_listings():
                              + supply + "," + supply_bracket + "," + buy_price + ","\
                              + sell_price + "," + demand + "," + demand_bracket + ","\
                              + collected_at
-                    #f.write(str(lineNo) + "," + listing + "\n")
-                    listings_string += str(lineNo) + "," + listing + "\n"
+                    f.write(str(lineNo) + "," + listing + "\n")
                     lineNo += 1
             del results
-            
-            with open(str(listings_tmp), "w") as f:
-                f.write(listings_string)
-            del listings_string
-            
             # If we aborted the export because we lost go, listings_tmp is broken and useless, so delete it. 
             if not go:
                 listings_tmp.unlink()
