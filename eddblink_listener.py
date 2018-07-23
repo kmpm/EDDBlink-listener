@@ -22,7 +22,6 @@ from calendar import timegm
 from pathlib import Path
 from collections import defaultdict, namedtuple, deque, OrderedDict
 from distutils.version import LooseVersion
-from macpath import curdir
 
 # Copyright (C) Oliver 'kfsone' Smith <oliver@kfs.org> 2015
 #
@@ -212,10 +211,16 @@ class Listener(object):
                     whitelist_match = list(filter(lambda x: x.get('software').lower() == software.lower(), config['whitelist']))
                     # Upload software not on whitelist is ignored.
                     if len(whitelist_match) == 0:
+                        if config['debug']:
+                            with debugPath.open('a', encoding = "utf-8") as fh:
+                                fh.write(system + "/" + station + " rejected with:" + software + swVersion +"\n")
                         continue
                     # Upload software with version less than the defined minimum is ignored. 
                     if whitelist_match[0].get("minversion"):
                         if LooseVersion(swVersion) < LooseVersion(whitelist_match[0].get("minversion")):
+                            if config['debug']:
+                                with debugPath.open('a', encoding = "utf-8") as fh:
+                                    fh.write(system + "/" + station + " rejected with:" + software + swVersion +"\n")
                             continue
                     # We've received real data.
 
@@ -267,9 +272,13 @@ def db_execute(db, sql_cmd, args = None):
             else:
                 result = cur.execute(sql_cmd)
             success = True
-        except sqlite3.OperationalError:
-            print("Database is locked, waiting for access.", end = "\r")
-            time.sleep(1)
+        except sqlite3.OperationalError as e:
+                if "locked" not in str(e):
+                    success = True
+                    raise sqlite3.OperationalError(e)
+                else:
+                    print("Database is locked, waiting for access.", end = "\r")
+                    time.sleep(1)
     return result
     
 
@@ -388,6 +397,7 @@ def load_config():
     config = OrderedDict([\
                             ('side', 'client'),                                                      \
                             ('verbose', True),                                                       \
+                            ('debug', False),                                                        \
                             ('plugin_options', "all,skipvend,force"),                                \
                             ('check_update_every_x_sec', 3600),                                      \
                             ('export_every_x_sec', 300),                                             \
@@ -463,6 +473,10 @@ def validate_config():
     if not isinstance(config["verbose"], bool):
         valid = False
         config_file = config_file.replace('"verbose"','"verbose_invalid"')
+
+    if not isinstance(config["debug"], bool):
+        valid = False
+        config_file = config_file.replace('"debug"','"debug_invalid"')
         
     # For this one, rather than completely replace invalid values with the default,
     # check to see if any of the values are valid, and keep them, prepnding the
@@ -523,6 +537,9 @@ def process_messages():
     
     while go:
         db = tdb.getDB()
+        # Place the database into autocommit mode to avoid issues with 
+        # sqlite3 doing automatic transactions.
+        db.isolation_level = None
         
         # We don't want the threads interfering with each other,
         # so pause this one if either the update checker or
@@ -535,14 +552,21 @@ def process_messages():
             process_ack = False
             # Just in case we caught the shutdown command while waiting.
             if not go:
-                #Make sure any changes are committed before shutting down.
-                success = False
+                # Make sure any changes are committed before shutting down.
+                #
+                # As we are using autocommit, bypass the db.commit() for now
+                # by setting success to "True"
+                success = True
                 while not success:
                     try:
                         db.commit()
                         success = True
-                    except sqlite3.OperationalError:
-                        print("Database is locked, waiting for access.", end = "\r")
+                    except sqlite3.OperationalError as e:
+                        if "locked" not in str(e):
+                            success = True
+                            raise sqlite3.OperationalError(e)
+                    else:
+                        print("(execute) Database is locked, waiting for access.", end = "\r")
                         time.sleep(1)
                     db.close()
                 break
@@ -559,6 +583,9 @@ def process_messages():
         # Get the station_is using the system and station names.
         system = entry.system.upper()
         station = entry.station.upper()
+        # And the software version used to upload the schema.
+        software = entry.software
+        swVersion = entry.version
         
         try:
             station_id = station_ids[system + "/" + station]
@@ -586,6 +613,10 @@ def process_messages():
         
         start_update = datetime.datetime.now()
         items = dict()
+        if config['debug']:
+            with debugPath.open('a', encoding = "utf-8") as fh:
+                fh.write(system + "/" + station + " with station_id '" + str(station_id) + "' updated at " + modified + " using " + software + swVersion + " ---\n")
+            
         for commodity in commodities:
             # Get item_id using commodity name from message.
             try:
@@ -615,8 +646,25 @@ def process_messages():
         for key in item_ids:
             if key in items:
                 entry = items[key]
-                try:
-                    db_execute(db, """INSERT INTO StationItem
+            else:
+                entry = {'item_id':item_ids[key], 
+                           'demand_price':0,
+                           'demand_units':0,
+                           'demand_level':0,
+                           'supply_price':0,
+                           'supply_units':0,
+                           'supply_level':0,
+                        }
+            
+            if config['debug']:
+                with debugPath.open('a', encoding = "utf-8") as fh:
+                    fh.write("\t" + key + ": " + str(entry) + "\n")
+            
+            try:
+                # Skip inserting blank entries so as to not bloat DB.
+                if entry['demand_price'] == 0 and entry['supply_price'] == 0:
+                    raise sqlite3.IntegrityError
+                db_execute(db, """INSERT INTO StationItem
                             (station_id, item_id, modified,
                              demand_price, demand_units, demand_level,
                              supply_price, supply_units, supply_level, from_live)
@@ -624,9 +672,9 @@ def process_messages():
                             (station_id, entry['item_id'], modified,
                             entry['demand_price'], entry['demand_units'], entry['demand_level'],
                             entry['supply_price'], entry['supply_units'], entry['supply_level']))
-                except sqlite3.IntegrityError:
-                    try:
-                        db_execute(db, """UPDATE StationItem
+            except sqlite3.IntegrityError:
+                try:
+                    db_execute(db, """UPDATE StationItem
                                 SET modified = ?,
                                  demand_price = ?, demand_units = ?, demand_level = ?,
                                  supply_price = ?, supply_units = ?, supply_level = ?,
@@ -636,27 +684,17 @@ def process_messages():
                                  entry['demand_price'], entry['demand_units'], entry['demand_level'], 
                                  entry['supply_price'], entry['supply_units'], entry['supply_level'],
                                  station_id, entry['item_id']))
-                    except sqlite3.IntegrityError:
-                        if config['verbose']:
-                            print("Unable to insert or update: " + commodity)
-                del entry
-            else:
-                # Don't need to insert blank entries, just need to update 
-                # formerly not blank entries so they'll get deleted.
-                try:
-                    db_execute(db, """UPDATE StationItem
-                                SET modified = ?,
-                                 demand_price = 0, demand_units = 0, demand_level = 0,
-                                 supply_price = 0, supply_units = 0, supply_level = 0,
-                                 from_live = 1
-                                WHERE station_id = ? AND item_id = ?""",
-                                (modified, station_id, item_ids[key]))
-                except sqlite3.IntegrityError:
-                    pass
+                except sqlite3.IntegrityError as e:
+                    if config['verbose']:
+                        print("Unable to insert or update: '" + commodity + "' Error: " + str(e))
+            
+            del entry
         
         # Don't try to commit if there are still messages waiting.
         if len(q) == 0:
-            success = False
+            # As we are using autocommit, bypass the db.commit() for now
+            # by setting success to "True"
+            success = True
             while not success:
                 try:
                     db.commit()
@@ -664,8 +702,8 @@ def process_messages():
                 except sqlite3.OperationalError:
                     print("Database is locked, waiting for access.", end = "\r")
                     time.sleep(1)
-                
-        db.close()
+            # Don't close DB until we've committed the changes.
+            db.close()
 
         if config['verbose']:
             print("Market update for " + system + "/" + station\
@@ -721,6 +759,7 @@ def export_listings():
                         break
                     print("Busy signal off, listings exporter resuming.")
                     now = time.time()
+                time.sleep(1)
             
             # We may be here because we broke out of the waiting loop,
             # so we need to see if we lost go and quit the main loop if so. 
@@ -891,6 +930,7 @@ export_busy = False
 
 dataPath = Path(tradeenv.TradeEnv().dataDir).resolve()
 eddbPath = plugins.eddblink_plug.ImportPlugin(tdb, tradeenv.TradeEnv()).dataPath.resolve()
+debugPath = eddbPath / Path("debug.txt")
 
 db_name, item_ids, system_ids, station_ids = update_dicts()
 
